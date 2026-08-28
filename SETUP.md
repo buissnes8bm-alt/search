@@ -1,10 +1,15 @@
 # Setup — Lebanon product scanner
 
 This is an n8n workflow. Once a day at 09:00 Beirut it searches for products
-trending in the US, has Claude score each one for the Lebanese market, sends you
+trending in the US, has Gemini score each one for the Lebanese market, sends you
 the shortlist on Telegram, and logs every score to a Google Sheet.
 
 Setup is about 25 minutes, most of it waiting on Google's OAuth screen.
+
+**It costs nothing to run.** Gemini's free tier does the scoring, Serper's free
+credits cover about 20 months of searches, and Telegram and Google Sheets are
+free. No credit card is needed for any of it. The one thing that may cost money
+is n8n itself: self-hosting is free, n8n Cloud is not.
 
 If you have never used n8n: a workflow is a chain of **nodes**. Each node gets
 the previous node's output as JSON and passes its own JSON on. Anywhere you see
@@ -51,25 +56,84 @@ the JSON.
 
 ---
 
-## 3. Anthropic
+## 3. Google Gemini (the scoring model)
 
-1. Get a key at <https://console.anthropic.com> → **API Keys**. Put some credit
-   on the account; this workflow does not run on the free trial indefinitely.
-2. Add a **second** Header Auth credential (same type as Serper, different
-   values):
-   - **Name**: `ANTHROPIC_API_KEY`
-   - **Header Name**: `x-api-key`
+This is where the workflow reads the search results and scores them. It runs on
+Gemini's **free tier** — no credit card, no billing account.
+
+### A subscription is not an API key
+
+If you pay for **Gemini Advanced / Google One AI Premium** (the chatbot in the
+app and on gemini.google.com), that subscription does **not** give you API
+access. They are separate products on separate billing. Paying for the app does
+not raise your API limits, and not paying for it does not lower them.
+
+What you need is a free API key from **Google AI Studio**, which is a different
+thing from the consumer subscription and costs nothing.
+
+1. Go to <https://aistudio.google.com/apikey> and sign in with your Google
+   account.
+2. Click **Create API key**. Accept the free tier when prompted — do not attach
+   a billing account unless you actually want paid limits.
+3. Copy the key.
+4. In n8n: **Add credential** → **Header Auth** (same credential type as Serper,
+   different values):
+   - **Name**: `GEMINI_API_KEY`
+   - **Header Name**: `x-goog-api-key`
    - **Header Value**: your key
-3. Open the **Claude Score Products** node → set its credential to
-   `ANTHROPIC_API_KEY`.
+5. Open the **Score Products** node → set its credential to `GEMINI_API_KEY`.
 
-The other two headers this API needs (`anthropic-version` and `content-type`)
-are already set as plain header parameters in the node — leave them alone.
+The key goes in a header, not in the URL. Google's own docs often show
+`?key=YOUR_KEY` on the end of the URL; do not do that here. URLs get written to
+logs, and n8n stores this node's URL in plain text inside `workflow.json`.
 
-**Cost per run:** the input blob is capped at 12,000 characters (~3,000 tokens)
-and the reply is capped at 4,000 tokens. At Sonnet pricing that is well under a
-cent per run, so under $0.30/month. The cap on `max_tokens` is a ceiling, not a
-target; a normal reply is 10–20 products and nowhere near it.
+### Free tier limits
+
+One run a day makes **one** API call. The free tier's limits are measured in
+requests per minute and requests per day, and one call a day is orders of
+magnitude below any of them. You are not going to come close.
+
+I cannot verify Google's current limits or model list from here — both change.
+If you want the live numbers, they are at
+<https://ai.google.dev/gemini-api/docs/rate-limits>.
+
+### Choosing the model
+
+The model id is the only variable part of the node's URL:
+
+```
+https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent
+                                                        ^^^^^^^^^^^^^^^^
+```
+
+It ships as `gemini-2.0-flash` because that is the safest free-tier default.
+
+**If you want better scoring, try a Pro model** — swap that segment for
+`gemini-2.5-pro` (or whatever the current Pro id is). Pro reasons better about
+the kind of judgement this prompt asks for: weighing saturation against novelty,
+being genuinely skeptical rather than agreeable. For a single call per day the
+extra cost in time is irrelevant.
+
+The catch: Pro models have much tighter free-tier limits than Flash, and are
+sometimes not on the free tier at all. If you swap it and get `429
+RESOURCE_EXHAUSTED` or `404 NOT_FOUND`, put `gemini-2.0-flash` back. Nothing else
+in the workflow needs to change either way.
+
+To see exactly which models your key can reach:
+
+```bash
+curl -s -H "x-goog-api-key: YOUR_KEY" \
+  "https://generativelanguage.googleapis.com/v1beta/models" \
+  | python3 -c "import json,sys; [print(m['name']) for m in json.load(sys.stdin)['models']]"
+```
+
+### Why this is more reliable than a plain prompt
+
+The request sets `responseMimeType: application/json` and a `responseSchema`
+pinning every field. Gemini is constrained to emit exactly that shape, so there
+are no code fences, no `Here you go:` preamble, and no malformed objects to
+recover from. The fence-stripping in `Parse and Filter` is still there as a
+belt-and-braces fallback, but it should never need to fire.
 
 ---
 
@@ -152,35 +216,37 @@ use the negative ID from the same `getUpdates` call.
 ## 6. Test it without spending anything
 
 Section 8 of the spec has real scan output. Use it to exercise nodes 6–9 without
-calling Serper or Anthropic.
+calling Serper or Gemini.
 
-1. Click the **Claude Score Products** node.
+1. Click the **Score Products** node.
 2. In the **OUTPUT** panel, click **Edit Output** (the pencil). This *pins* data
    to the node.
-3. Paste this — it is the sample data wrapped in the shape the Anthropic API
+3. Paste this — it is the sample data wrapped in the shape the Gemini API
    actually returns, which is what the next node parses:
 
 ```json
 [
   {
-    "id": "msg_test",
-    "type": "message",
-    "role": "assistant",
-    "model": "claude-sonnet-5",
-    "content": [
+    "candidates": [
       {
-        "type": "text",
-        "text": "[{\"product\":\"Electric baby nail trimmer\",\"score\":8,\"reason\":\"Battery powered, tiny, solves real parent fear, silent demo works\",\"est_retail_usd\":16,\"est_landed_usd\":6,\"risk\":\"Parents hesitate on electric devices near infants\"},{\"product\":\"Car multi-function storage bag\",\"score\":8,\"reason\":\"No power needed, near-zero shipping weight, car-heavy country\",\"est_retail_usd\":13,\"est_landed_usd\":4,\"risk\":\"Low novelty, needs visual differentiation\"},{\"product\":\"Mini electric garlic chopper\",\"score\":7,\"reason\":\"Lebanese cooking runs on garlic, demo is instantly satisfying\",\"est_retail_usd\":17,\"est_landed_usd\":6,\"risk\":\"Must be USB rechargeable, not mains powered\"},{\"product\":\"Cooling neck fan\",\"score\":7,\"reason\":\"Battery power works during outages, heat runs through September\",\"est_retail_usd\":20,\"est_landed_usd\":7,\"risk\":\"Four week runway left, lithium customs friction\"},{\"product\":\"Pimple patches\",\"score\":7,\"reason\":\"Weightless shipping, no power, visible before-after, repeat purchase\",\"est_retail_usd\":10,\"est_landed_usd\":2,\"risk\":\"Counterfeits everywhere, one bad batch ends reputation\"},{\"product\":\"Magnetic phone charger\",\"score\":6,\"reason\":\"Power cuts make portable charging genuinely useful\",\"est_retail_usd\":22,\"est_landed_usd\":9,\"risk\":\"Saturated market, lithium cells expensive to air freight\"}]"
+        "content": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "[{\"product\":\"Electric baby nail trimmer\",\"score\":8,\"reason\":\"Battery powered, tiny, solves real parent fear, silent demo works\",\"est_retail_usd\":16,\"est_landed_usd\":6,\"risk\":\"Parents hesitate on electric devices near infants\"},{\"product\":\"Car multi-function storage bag\",\"score\":8,\"reason\":\"No power needed, near-zero shipping weight, car-heavy country\",\"est_retail_usd\":13,\"est_landed_usd\":4,\"risk\":\"Low novelty, needs visual differentiation\"},{\"product\":\"Mini electric garlic chopper\",\"score\":7,\"reason\":\"Lebanese cooking runs on garlic, demo is instantly satisfying\",\"est_retail_usd\":17,\"est_landed_usd\":6,\"risk\":\"Must be USB rechargeable, not mains powered\"},{\"product\":\"Cooling neck fan\",\"score\":7,\"reason\":\"Battery power works during outages, heat runs through September\",\"est_retail_usd\":20,\"est_landed_usd\":7,\"risk\":\"Four week runway left, lithium customs friction\"},{\"product\":\"Pimple patches\",\"score\":7,\"reason\":\"Weightless shipping, no power, visible before-after, repeat purchase\",\"est_retail_usd\":10,\"est_landed_usd\":2,\"risk\":\"Counterfeits everywhere, one bad batch ends reputation\"},{\"product\":\"Magnetic phone charger\",\"score\":6,\"reason\":\"Power cuts make portable charging genuinely useful\",\"est_retail_usd\":22,\"est_landed_usd\":9,\"risk\":\"Saturated market, lithium cells expensive to air freight\"}]"
+            }
+          ]
+        },
+        "finishReason": "STOP"
       }
     ],
-    "stop_reason": "end_turn",
-    "usage": { "input_tokens": 3000, "output_tokens": 800 }
+    "usageMetadata": { "promptTokenCount": 3000, "candidatesTokenCount": 800 }
   }
 ]
 ```
 
 4. Click **Test workflow**. n8n uses the pinned data instead of calling
-   Anthropic, so nodes 6, 7, 8a and 9 run for free.
+   Gemini, so nodes 6, 7, 8a and 9 run for free.
 
 You should get a Telegram message listing the top 5 (the magnetic phone charger
 scores 6, survives the filter, but is cut by the top-5 cap) and six new rows in
@@ -228,7 +294,7 @@ Serper Search           runs 4×, once per query. Retry 3× / 5s
       ↓
 Flatten Results         4 responses → 1 text blob, deduped, ≤12,000 chars
       ↓
-Claude Score Products   one call: extraction + scoring. Retry 2×
+Score Products   one call: extraction + scoring. Retry 2×
       ↓
 Parse and Filter        strip fences → JSON → drop score<6 → sort desc
       ↓                 → drop anything reported on a previous run
@@ -262,9 +328,9 @@ from filling with the same products every day. Low scorers still reach the sheet
 simply left out of the Telegram message. Those rejects are the point: they are
 the negative examples that make section 7 of the spec worth filling in.
 
-**The Anthropic body is plain JSON with one expression in it.** The system
-prompt sits in the node as a literal string, so you can read and edit it in the
-n8n UI without touching code. Only `"content"` is
+**The Gemini body is plain JSON with one expression in it.** The system
+prompt sits in the node as a literal string under `systemInstruction`, so you can
+read and edit it in the n8n UI without touching code. Only the user `text` is
 `{{ JSON.stringify($json.blob) }}` — `JSON.stringify` is what escapes the quotes
 and newlines in the search text so the body stays valid JSON.
 
@@ -275,7 +341,7 @@ and newlines in the search text so the body stays valid JSON.
 Both are noted so you can revert either in under a minute.
 
 **Result URLs go into the blob.** The spec says to extract `title` and `snippet`.
-The system prompt (used verbatim) asks Claude for a `source_url` field, which it
+The system prompt (used verbatim) asks the model for a `source_url` field, which it
 cannot fill from title and snippet alone — every value would be `null`. So
 `Flatten Results` appends `[url]` to each line. To revert: delete the `link`
 variable and the `lines.push` ternary in that node. The 12,000-char cap holds
@@ -287,11 +353,12 @@ that branch and only one of them is actually "nothing cleared the bar":
 
 | Situation | What gets sent |
 |---|---|
-| Claude returned no products at all | `Scan complete. Nothing cleared the bar today.` (the spec string) |
+| Gemini returned no products at all | `Scan complete. Nothing cleared the bar today.` (the spec string) |
 | Everything scored was already reported | `Scan complete. N products scored, all already reported. Nothing new today.` |
-| Claude's reply would not parse | `Scan complete. Claude response could not be parsed. Raw: ...` |
+| The reply would not parse | `Scan complete. Model response could not be parsed. Raw: ...` |
+| The model returned nothing at all | `Scan complete. The model returned no usable output: ...` naming the block reason or cut-off |
 
-Sending "nothing cleared the bar" when Claude actually returned unreadable
+Sending "nothing cleared the bar" when the model actually returned unreadable
 output, or when six good products were found and merely suppressed as repeats,
 would hide the thing you need to know. To revert, set the `message` variable in
 `Parse and Filter` to the fixed sentence on all three paths.
@@ -318,14 +385,17 @@ only the Telegram copy is sanitised.
 | `400 chat not found` | Wrong chat ID, or you used the bot's own ID instead of yours. |
 | `getUpdates` returns `"result": []` | No unconsumed messages. Send the bot another message. |
 | Telegram sends nothing, no error | Zero items reached the node. Check the IF node's branches in the execution view. |
-| `401` from Serper or Anthropic | Credential not attached to the node, or the header **name** is wrong — `X-API-KEY` for Serper, `x-api-key` for Anthropic. They are different. |
+| `401`/`403` from Serper or Gemini | Credential not attached to the node, or the header **name** is wrong — `X-API-KEY` for Serper, `x-goog-api-key` for Gemini. They are different. |
+| `404 NOT_FOUND` on the model | That model id is not available to your key. Run the list-models curl in section 3 and swap the id in the node's URL. |
+| `429 RESOURCE_EXHAUSTED` | Free-tier limit hit — almost always because you switched to a Pro model. Go back to `gemini-2.0-flash`. |
+| Telegram says the model returned no usable output | Gemini was blocked or cut off. The message names which; if it says `maxOutputTokens`, raise it in the node body. |
 | Sheet rows land in the wrong columns | Header row text does not match the seven column names exactly. |
-| A row with `(parse error)` | Claude returned non-JSON. The `raw` field in that execution holds the first 500 characters. |
+| A row with `(parse error)` | The model returned non-JSON. The `raw` field in that execution holds the first 500 characters. |
 | `Nothing new today` every day | De-duplication is working and the searches genuinely are returning the same products. See section 12 if you want to reset. |
 | Products you have never seen are being suppressed | Two different products matched as one. Section 12 explains the matcher and how to clear memory. |
 | De-duplication seems not to work | You are testing manually. n8n only persists static data on scheduled runs. Section 6. |
 | No sheet rows on some days | Expected: nothing new was found, so the false branch ran and wrote nothing. |
-| Every score is 7+ | The prompt anticipates this and tells Claude to re-score harder. If it persists, section 7 real data is what actually fixes it. |
+| Every score is 7+ | The prompt anticipates this and tells the model to re-score harder. If it persists, section 7 real data is what actually fixes it. |
 | Workflow runs but nothing arrives on Telegram | Check the workflow is **Active**, not just saved. |
 
 To read a past run: **Executions** in the left sidebar → pick one → click any
@@ -346,7 +416,7 @@ The loop that fixes it:
    included.
 2. When you actually test a product, record the outcome next to its row.
 3. Once you have ~10 real outcomes, append them to the end of the system prompt
-   in the `Claude Score Products` node, before the `Return ONLY a JSON array`
+   in the `Score Products` node, before the `Return ONLY a JSON array`
    paragraph:
 
    ```
