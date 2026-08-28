@@ -1,0 +1,428 @@
+{
+  "name": "Lebanon Product Scanner",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Daily 06:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 2 — Search queries\n// Emits ONE ITEM PER QUERY so the next HTTP node runs once per query.\n// Month/year come from $now, so this keeps working without edits.\n\nconst month = $now.toFormat('MMMM');\nconst year = $now.toFormat('yyyy');\n\nconst queries = [\n  `trending products ${month} ${year} tiktok`,\n  `viral products ${month} ${year} amazon`,\n  `best selling dropshipping products ${month} ${year}`,\n  `tiktok shop trending products this week`,\n];\n\nreturn queries.map((query) => ({ json: { query } }));\n"
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Search Queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://google.serper.dev/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"q\": {{ JSON.stringify($json.query) }}, \"num\": 10 }",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Serper Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_SERPER_CREDENTIAL_ID",
+          "name": "SERPER_API_KEY"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 4 — Flatten results\n// Input: one item per Serper response (4 of them).\n// Output: ONE item with a single text blob, capped at 12,000 characters.\n\nconst CHAR_CAP = 12000;\n\nconst lines = [];\nconst seen = new Set();\n\nfor (const item of $input.all()) {\n  const body = item.json.body ?? item.json;\n  const organic = Array.isArray(body.organic) ? body.organic : [];\n\n  for (const result of organic) {\n    const title = String(result.title ?? '').replace(/\\s+/g, ' ').trim();\n    const snippet = String(result.snippet ?? '').replace(/\\s+/g, ' ').trim();\n    const link = String(result.link ?? '').trim();\n    if (!title && !snippet) continue;\n\n    const key = (title + '|' + snippet).toLowerCase();\n    if (seen.has(key)) continue;\n    seen.add(key);\n\n    lines.push(link ? `${title} — ${snippet} [${link}]` : `${title} — ${snippet}`);\n  }\n}\n\n// Cap on a whole-result boundary so Claude never reads a half-truncated entry.\nlet blob = '';\nlet used = 0;\nfor (const line of lines) {\n  if (used + line.length + 1 > CHAR_CAP) break;\n  blob += line + '\\n';\n  used += line.length + 1;\n}\n\nreturn [{ json: { blob: blob.trim(), resultCount: lines.length, blobChars: blob.trim().length } }];\n"
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Flatten Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-5\",\n  \"max_tokens\": 4000,\n  \"system\": \"You are a product sourcing analyst for the Lebanese consumer market.\\n\\nYou will receive raw search result text about products trending in the US.\\nExtract every specific physical product mentioned. Ignore categories,\\nservices, apps, subscriptions, software, and anything that cannot be shipped\\nin a box.\\n\\nScore each product 1-10 on how likely it is to sell in LEBANON. Lebanon is\\nnot the US. Score against these realities:\\n\\nPRICE. Buyers pay cash in USD. Above $25 retail is a hard sell. Under $15 is\\nthe sweet spot. If it cannot be sourced cheap, it scores low no matter how\\ngood it is.\\n\\nELECTRICITY. Mains power is unreliable and generator hours are limited.\\nPenalize constant mains power, long charge times, high wattage. Reward\\nbattery, USB, solar, and fully manual products.\\n\\nSHIPPING. It arrives by air cargo or Aramex. Penalize bulk, weight,\\nfragility, liquids, aerosols, and heavy lithium cells. If shipping costs more\\nthan the product, it is dead.\\n\\nVIDEO. It must be obvious in a 15-second Reel with no sound and no\\nexplanation. Reward visible before/after and satisfying motion. Penalize\\nanything needing a paragraph to understand.\\n\\nSATURATION. If it is already in every Instagram shop, Souk el Ahad, and Bourj\\nHammoud, score it low. Novelty beats quality in this market.\\n\\nRETURNS. There is no return culture. Penalize products that disappoint on\\narrival: sizing, fit, fragile electronics, anything the photo oversells.\\n\\nLOCAL FIT. Bonus for solving something specifically Lebanese: power cuts,\\nwater storage, generator noise, small apartments, hot summers, long drives,\\nhosting guests.\\n\\nBe skeptical. Most US trends fail in Lebanon. A score of 8 or above should be\\nrare — no more than two or three per run. If everything is scoring 7 or\\nhigher, you are being too generous. Score again, harder.\\n\\nNever invent sales figures or supplier prices. Price fields are your\\nestimates and should be treated as such.\\n\\nReturn ONLY a JSON array. No prose, no markdown fences, no preamble. Each\\nobject:\\n{\\n  \\\"product\\\": \\\"cleaned up product name\\\",\\n  \\\"score\\\": <integer 1-10>,\\n  \\\"reason\\\": \\\"<max 20 words, the deciding factor>\\\",\\n  \\\"est_retail_usd\\\": <number>,\\n  \\\"est_landed_usd\\\": <number>,\\n  \\\"risk\\\": \\\"<the single biggest reason it fails in Lebanon>\\\",\\n  \\\"source_url\\\": \\\"<url it came from, or null>\\\"\\n}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": {{ JSON.stringify($json.blob) }} }\n  ]\n}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "Claude Score Products",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ANTHROPIC_CREDENTIAL_ID",
+          "name": "ANTHROPIC_API_KEY"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 6 — Parse and filter\n// Reads Claude's reply, strips fences, parses JSON, drops score < 6, sorts desc.\n// Emits ONE ITEM PER PRODUCT (all of them, including the ones filtered out) so\n// the Google Sheets node can log every row. Each item also carries the same\n// `hasProducts` flag and prebuilt `message`, which the IF and Telegram nodes use.\n\nconst SCORE_THRESHOLD = 6;\nconst TOP_N = 5;\n\nconst date = $now.toFormat('yyyy-MM-dd');\n\nconst incoming = $input.first().json;\nconst body = incoming.body ?? incoming;\n\nlet text = '';\ntry {\n  text = body.content[0].text;\n} catch (e) {\n  text = typeof body === 'string' ? body : JSON.stringify(body);\n}\n\nfunction stripFences(s) {\n  return String(s || '')\n    .trim()\n    .replace(/^```(?:json)?\\s*/i, '')\n    .replace(/```\\s*$/, '')\n    .trim();\n}\n\nfunction sliceArray(s) {\n  const start = s.indexOf('[');\n  const end = s.lastIndexOf(']');\n  if (start === -1 || end === -1 || end < start) return null;\n  return s.slice(start, end + 1);\n}\n\n// Telegram legacy Markdown does not reliably honour backslash escapes, so the\n// safe move is to remove the characters that break a message rather than escape\n// them. Anything with _ * ` [ ] in it would otherwise fail to send.\nfunction clean(v) {\n  return String(v ?? '')\n    .replace(/[_*`\\[\\]]/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction num(v) {\n  const n = Number(v);\n  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;\n}\n\nfunction money(v) {\n  const n = num(v);\n  return n === null ? '?' : n;\n}\n\nlet parsed;\ntry {\n  const cleaned = stripFences(text);\n  try {\n    parsed = JSON.parse(cleaned);\n  } catch (e) {\n    const arr = sliceArray(cleaned);\n    if (!arr) throw e;\n    parsed = JSON.parse(arr);\n  }\n  if (!Array.isArray(parsed)) throw new Error('Expected a JSON array');\n} catch (err) {\n  // Never fail the workflow on a bad response — report it downstream instead.\n  return [{\n    json: {\n      error: true,\n      raw: String(text).slice(0, 500),\n      hasProducts: false,\n      passed: false,\n      message: '',\n      date,\n      product: '(parse error)',\n      score: 0,\n      est_retail_usd: null,\n      est_landed_usd: null,\n      reason: 'Claude response could not be parsed as JSON',\n      risk: String(err.message).slice(0, 200),\n    },\n  }];\n}\n\nconst scored = parsed\n  .map((p) => {\n    const rawScore = Number(p.score);\n    const score = Number.isFinite(rawScore)\n      ? Math.min(10, Math.max(0, Math.round(rawScore)))\n      : 0;\n    return {\n      date,\n      product: String(p.product ?? '').replace(/\\s+/g, ' ').trim(),\n      score,\n      est_retail_usd: num(p.est_retail_usd),\n      est_landed_usd: num(p.est_landed_usd),\n      reason: String(p.reason ?? '').replace(/\\s+/g, ' ').trim(),\n      risk: String(p.risk ?? '').replace(/\\s+/g, ' ').trim(),\n      source_url: p.source_url ?? null,\n    };\n  })\n  .filter((p) => p.product.length > 0);\n\nscored.sort((a, b) => b.score - a.score);\n\nconst survivors = scored.filter((p) => p.score >= SCORE_THRESHOLD);\nconst hasProducts = survivors.length > 0;\n\nlet message = '';\nif (hasProducts) {\n  const top = survivors.slice(0, TOP_N);\n  message = `*Product scan — ${date}*\\n\\n`;\n  top.forEach((p, i) => {\n    message += `*${i + 1}. ${clean(p.product)} — ${p.score}/10*\\n`;\n    message += `${clean(p.reason)}\\n`;\n    message += `Retail ~$${money(p.est_retail_usd)} | Landed ~$${money(p.est_landed_usd)}\\n`;\n    message += `Risk: ${clean(p.risk)}\\n\\n`;\n  });\n  message += '_Prices are estimates. Verify on AliExpress before buying._';\n}\n\n// Claude returned a well-formed but empty array: still emit one item so the IF\n// node fires and the \"nothing found\" Telegram message goes out.\nif (scored.length === 0) {\n  return [{\n    json: {\n      error: false,\n      hasProducts: false,\n      passed: false,\n      message: '',\n      date,\n      product: '(no products extracted)',\n      score: 0,\n      est_retail_usd: null,\n      est_landed_usd: null,\n      reason: 'Search results contained no shippable physical products',\n      risk: '',\n    },\n  }];\n}\n\nreturn scored.map((p) => ({\n  json: {\n    ...p,\n    error: false,\n    hasProducts,\n    passed: p.score >= SCORE_THRESHOLD,\n    message,\n  },\n}));\n"
+      },
+      "id": "a1000000-0000-4000-8000-000000000006",
+      "name": "Parse and Filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.hasProducts }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000007",
+      "name": "Anything Survive?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        760,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000008",
+      "name": "Telegram: Shortlist",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1000,
+        100
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.error ? 'Scan complete. Claude response could not be parsed. Raw: ' + String($json.raw).replace(/[_*`\\[\\]]/g, ' ').slice(0, 400) : 'Scan complete. Nothing cleared the bar today.' }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000009",
+      "name": "Telegram: Nothing Found",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1000,
+        300
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "date": "={{ $json.date }}",
+            "product": "={{ $json.product }}",
+            "score": "={{ $json.score }}",
+            "est_retail_usd": "={{ $json.est_retail_usd }}",
+            "est_landed_usd": "={{ $json.est_landed_usd }}",
+            "reason": "={{ $json.reason }}",
+            "risk": "={{ $json.risk }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "date",
+              "displayName": "date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "product",
+              "displayName": "product",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score",
+              "displayName": "score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "est_retail_usd",
+              "displayName": "est_retail_usd",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "est_landed_usd",
+              "displayName": "est_landed_usd",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reason",
+              "displayName": "reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "risk",
+              "displayName": "risk",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-00000000000a",
+      "name": "Log All Scores",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        760,
+        460
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 06:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "Search Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Queries": {
+      "main": [
+        [
+          {
+            "node": "Serper Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Serper Search": {
+      "main": [
+        [
+          {
+            "node": "Flatten Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten Results": {
+      "main": [
+        [
+          {
+            "node": "Claude Score Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Score Products": {
+      "main": [
+        [
+          {
+            "node": "Parse and Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and Filter": {
+      "main": [
+        [
+          {
+            "node": "Anything Survive?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log All Scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything Survive?": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Shortlist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram: Nothing Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
