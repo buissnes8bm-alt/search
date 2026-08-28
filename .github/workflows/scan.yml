@@ -1,0 +1,100 @@
+name: Daily product scan
+
+on:
+  schedule:
+    # 06:00 UTC = 09:00 Beirut in summer, 08:00 in winter (Lebanon observes DST,
+    # cron does not). GitHub runs schedules in UTC only.
+    #
+    # NOTE: scheduled workflows only ever run on the repository's DEFAULT
+    # branch. If you move this file to another branch it will silently never
+    # fire. GitHub also disables schedules on repos with 60 days of no activity
+    # — the state commit at the end of this job counts as activity, so an
+    # active scanner keeps itself alive.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      sample:
+        description: "Use built-in sample data (no Serper/Gemini calls)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Print output only; do not send or record anything"
+        type: boolean
+        default: false
+
+# Never let two scans overlap and race on state/seen.json.
+concurrency:
+  group: product-scan
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scan
+        env:
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.0-flash' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_TAB: ${{ vars.SHEET_TAB || 'Sheet1' }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python -m scanner \
+            ${{ inputs.sample && '--sample' || '' }} \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Commit updated memory
+        # Runs even if the scan step failed, so a partial run still records what
+        # it managed to write. The scanner itself only saves state after a
+        # successful send, so there is nothing misleading to commit.
+        if: always() && inputs.dry_run != true
+        run: |
+          if git diff --quiet -- state/seen.json; then
+            echo "no memory changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/seen.json
+          git commit -m "chore: record products seen on $(date -u +%Y-%m-%d)"
+          # Another run may have pushed while this one was scanning.
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "push failed, rebasing and retrying ($attempt)"
+            git pull --rebase --autostash || true
+            sleep $((attempt * 5))
+          done
+          echo "could not push state after 3 attempts" >&2
+          exit 1
+
+  test:
+    # Cheap guard: if the scanner's own tests break, you want to know from the
+    # daily run rather than from a silent wrong result.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest
