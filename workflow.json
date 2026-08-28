@@ -23,7 +23,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Node 2 — Search queries\n// Emits ONE ITEM PER QUERY so the next HTTP node runs once per query.\n// Month/year come from $now, so this keeps working without edits.\n\nconst month = $now.toFormat('MMMM');\nconst year = $now.toFormat('yyyy');\n\nconst queries = [\n  `trending products ${month} ${year} tiktok`,\n  `viral products ${month} ${year} amazon`,\n  `best selling dropshipping products ${month} ${year}`,\n  `tiktok shop trending products this week`,\n];\n\nreturn queries.map((query) => ({ json: { query } }));\n"
+        "jsCode": "// Node 2 — Search queries\n// Emits ONE ITEM PER QUERY so the next HTTP node runs once per query.\n// Month/year come from $now, so this keeps working without edits.\n//\n// Four queries are drawn from a rotating pool each day. Running the same four\n// strings every day returns the same Google results all month, which is what\n// made consecutive runs look identical. The pool size (12) and the step (5) are\n// coprime, so the starting offset visits all 12 positions before repeating.\n\nconst QUERIES_PER_RUN = 4;\nconst ROTATION_STEP = 5;\n\nconst month = $now.toFormat('MMMM');\nconst year = $now.toFormat('yyyy');\n\nconst pool = [\n  // the original four from the spec\n  `trending products ${month} ${year} tiktok`,\n  `viral products ${month} ${year} amazon`,\n  `best selling dropshipping products ${month} ${year}`,\n  `tiktok shop trending products this week`,\n  // different sources, to get off the same listicles every day\n  `tiktok made me buy it ${month} ${year}`,\n  `amazon movers and shakers ${month} ${year}`,\n  `viral gadgets ${month} ${year} reddit`,\n  `winning products to sell online ${month} ${year}`,\n  // category sweeps, which surface products the general queries never reach\n  `trending kitchen gadgets ${month} ${year}`,\n  `trending car accessories ${month} ${year}`,\n  `viral home organization products ${month} ${year}`,\n  `best selling beauty tools ${month} ${year}`,\n];\n\n// Day number since epoch, derived from the date string rather than a Luxon\n// helper so the rotation is easy to reason about and to test.\nconst [y, m, d] = $now.toFormat('yyyy-MM-dd').split('-').map(Number);\nconst dayNumber = Math.floor(Date.UTC(y, m - 1, d) / 86400000);\nconst start = (dayNumber * ROTATION_STEP) % pool.length;\n\nconst queries = [];\nfor (let i = 0; i < QUERIES_PER_RUN; i++) {\n  queries.push(pool[(start + i) % pool.length]);\n}\n\nreturn queries.map((query) => ({ json: { query } }));\n"
       },
       "id": "a1000000-0000-4000-8000-000000000002",
       "name": "Search Queries",
@@ -122,7 +122,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Node 6 — Parse and filter\n// Reads Claude's reply, strips fences, parses JSON, drops score < 6, sorts desc.\n// Emits ONE ITEM PER PRODUCT (all of them, including the ones filtered out) so\n// the Google Sheets node can log every row. Each item also carries the same\n// `hasProducts` flag and prebuilt `message`, which the IF and Telegram nodes use.\n\nconst SCORE_THRESHOLD = 6;\nconst TOP_N = 5;\n\nconst date = $now.toFormat('yyyy-MM-dd');\n\nconst incoming = $input.first().json;\nconst body = incoming.body ?? incoming;\n\nlet text = '';\ntry {\n  text = body.content[0].text;\n} catch (e) {\n  text = typeof body === 'string' ? body : JSON.stringify(body);\n}\n\nfunction stripFences(s) {\n  return String(s || '')\n    .trim()\n    .replace(/^```(?:json)?\\s*/i, '')\n    .replace(/```\\s*$/, '')\n    .trim();\n}\n\nfunction sliceArray(s) {\n  const start = s.indexOf('[');\n  const end = s.lastIndexOf(']');\n  if (start === -1 || end === -1 || end < start) return null;\n  return s.slice(start, end + 1);\n}\n\n// Telegram legacy Markdown does not reliably honour backslash escapes, so the\n// safe move is to remove the characters that break a message rather than escape\n// them. Anything with _ * ` [ ] in it would otherwise fail to send.\nfunction clean(v) {\n  return String(v ?? '')\n    .replace(/[_*`\\[\\]]/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction num(v) {\n  const n = Number(v);\n  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;\n}\n\nfunction money(v) {\n  const n = num(v);\n  return n === null ? '?' : n;\n}\n\nlet parsed;\ntry {\n  const cleaned = stripFences(text);\n  try {\n    parsed = JSON.parse(cleaned);\n  } catch (e) {\n    const arr = sliceArray(cleaned);\n    if (!arr) throw e;\n    parsed = JSON.parse(arr);\n  }\n  if (!Array.isArray(parsed)) throw new Error('Expected a JSON array');\n} catch (err) {\n  // Never fail the workflow on a bad response — report it downstream instead.\n  return [{\n    json: {\n      error: true,\n      raw: String(text).slice(0, 500),\n      hasProducts: false,\n      passed: false,\n      message: '',\n      date,\n      product: '(parse error)',\n      score: 0,\n      est_retail_usd: null,\n      est_landed_usd: null,\n      reason: 'Claude response could not be parsed as JSON',\n      risk: String(err.message).slice(0, 200),\n    },\n  }];\n}\n\nconst scored = parsed\n  .map((p) => {\n    const rawScore = Number(p.score);\n    const score = Number.isFinite(rawScore)\n      ? Math.min(10, Math.max(0, Math.round(rawScore)))\n      : 0;\n    return {\n      date,\n      product: String(p.product ?? '').replace(/\\s+/g, ' ').trim(),\n      score,\n      est_retail_usd: num(p.est_retail_usd),\n      est_landed_usd: num(p.est_landed_usd),\n      reason: String(p.reason ?? '').replace(/\\s+/g, ' ').trim(),\n      risk: String(p.risk ?? '').replace(/\\s+/g, ' ').trim(),\n      source_url: p.source_url ?? null,\n    };\n  })\n  .filter((p) => p.product.length > 0);\n\nscored.sort((a, b) => b.score - a.score);\n\nconst survivors = scored.filter((p) => p.score >= SCORE_THRESHOLD);\nconst hasProducts = survivors.length > 0;\n\nlet message = '';\nif (hasProducts) {\n  const top = survivors.slice(0, TOP_N);\n  message = `*Product scan — ${date}*\\n\\n`;\n  top.forEach((p, i) => {\n    message += `*${i + 1}. ${clean(p.product)} — ${p.score}/10*\\n`;\n    message += `${clean(p.reason)}\\n`;\n    message += `Retail ~$${money(p.est_retail_usd)} | Landed ~$${money(p.est_landed_usd)}\\n`;\n    message += `Risk: ${clean(p.risk)}\\n\\n`;\n  });\n  message += '_Prices are estimates. Verify on AliExpress before buying._';\n}\n\n// Claude returned a well-formed but empty array: still emit one item so the IF\n// node fires and the \"nothing found\" Telegram message goes out.\nif (scored.length === 0) {\n  return [{\n    json: {\n      error: false,\n      hasProducts: false,\n      passed: false,\n      message: '',\n      date,\n      product: '(no products extracted)',\n      score: 0,\n      est_retail_usd: null,\n      est_landed_usd: null,\n      reason: 'Search results contained no shippable physical products',\n      risk: '',\n    },\n  }];\n}\n\nreturn scored.map((p) => ({\n  json: {\n    ...p,\n    error: false,\n    hasProducts,\n    passed: p.score >= SCORE_THRESHOLD,\n    message,\n  },\n}));\n"
+        "jsCode": "// Node 6 — Parse, filter, and drop anything already seen\n//\n// Reads Claude's reply, strips fences, parses JSON, drops score < 6, sorts desc,\n// then removes every product this workflow has already reported on a previous\n// run. Emits ONE ITEM PER NEW PRODUCT (rejects included — those are the training\n// data), each carrying the same `hasNew` flag and the same finished `message`.\n//\n// Cross-run memory lives in $getWorkflowStaticData('global'), which n8n persists\n// on the workflow record between executions. Two things to know about it:\n//   - it is only saved after a SUCCESSFUL execution, so a failed Telegram send\n//     leaves products unseen and they get reported again next run, which is the\n//     safe direction to fail in;\n//   - n8n does not persist it for MANUAL test runs, only scheduled/production\n//     ones. Testing by hand will therefore show no de-duplication. That is\n//     expected, not a bug.\n\nconst SCORE_THRESHOLD = 6;\nconst TOP_N = 5;\nconst RETENTION_DAYS = 90;\nconst MAX_MEMORY = 500;\n\nconst date = $now.toFormat('yyyy-MM-dd');\n\nconst incoming = $input.first().json;\nconst body = incoming.body ?? incoming;\n\nlet text = '';\ntry {\n  text = body.content[0].text;\n} catch (e) {\n  text = typeof body === 'string' ? body : JSON.stringify(body);\n}\n\nfunction stripFences(s) {\n  return String(s || '')\n    .trim()\n    .replace(/^```(?:json)?\\s*/i, '')\n    .replace(/```\\s*$/, '')\n    .trim();\n}\n\nfunction sliceArray(s) {\n  const start = s.indexOf('[');\n  const end = s.lastIndexOf(']');\n  if (start === -1 || end === -1 || end < start) return null;\n  return s.slice(start, end + 1);\n}\n\n// Telegram legacy Markdown does not reliably honour backslash escapes, so the\n// safe move is to remove the characters that break a message rather than escape\n// them. Anything with _ * ` [ ] in it would otherwise fail to send.\nfunction clean(v) {\n  return String(v ?? '')\n    .replace(/[_*`\\[\\]]/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction num(v) {\n  const n = Number(v);\n  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;\n}\n\nfunction money(v) {\n  const n = num(v);\n  return n === null ? '?' : n;\n}\n\n// --- product identity -------------------------------------------------------\n// Case, punctuation and word order are all noise: \"LED Strip Lights\",\n// \"led strip lights\" and \"Strip Lights LED\" are the same product. Compare the\n// set of words instead of the string.\nfunction tokenize(name) {\n  return new Set(\n    String(name ?? '')\n      .toLowerCase()\n      .replace(/[^a-z0-9]+/g, ' ')\n      .split(' ')\n      .filter((w) => w.length > 1)\n  );\n}\n\nfunction isSubset(a, b) {\n  for (const x of a) if (!b.has(x)) return false;\n  return true;\n}\n\nfunction sameProduct(a, b) {\n  if (a.size === 0 || b.size === 0) return false;\n  if (a.size === b.size && isSubset(a, b)) return true;\n  // \"cooling neck fan\" and \"neck fan\" are the same thing. Only allow this when\n  // both names have at least two words, or a one-word name would swallow half\n  // the catalogue.\n  if (a.size >= 2 && b.size >= 2 && (isSubset(a, b) || isSubset(b, a))) return true;\n  return false;\n}\n\nfunction emit(json) {\n  return [{ json: { date, hasNew: false, passed: false, error: false, ...json } }];\n}\n\n// --- parse ------------------------------------------------------------------\nlet parsed;\ntry {\n  const cleaned = stripFences(text);\n  try {\n    parsed = JSON.parse(cleaned);\n  } catch (e) {\n    const arr = sliceArray(cleaned);\n    if (!arr) throw e;\n    parsed = JSON.parse(arr);\n  }\n  if (!Array.isArray(parsed)) throw new Error('Expected a JSON array');\n} catch (err) {\n  // Never fail the workflow on a bad response — report it downstream instead.\n  const raw = String(text).slice(0, 500);\n  return emit({\n    error: true,\n    raw,\n    emptyReason: 'parse_error',\n    message:\n      'Scan complete. Claude response could not be parsed. Raw: ' +\n      clean(raw).slice(0, 400),\n    product: '(parse error)',\n    score: 0,\n    est_retail_usd: null,\n    est_landed_usd: null,\n    reason: 'Claude response could not be parsed as JSON',\n    risk: String(err.message).slice(0, 200),\n  });\n}\n\nconst scored = parsed\n  .map((p) => {\n    const rawScore = Number(p.score);\n    const score = Number.isFinite(rawScore)\n      ? Math.min(10, Math.max(0, Math.round(rawScore)))\n      : 0;\n    return {\n      date,\n      product: String(p.product ?? '').replace(/\\s+/g, ' ').trim(),\n      score,\n      est_retail_usd: num(p.est_retail_usd),\n      est_landed_usd: num(p.est_landed_usd),\n      reason: String(p.reason ?? '').replace(/\\s+/g, ' ').trim(),\n      risk: String(p.risk ?? '').replace(/\\s+/g, ' ').trim(),\n      source_url: p.source_url ?? null,\n    };\n  })\n  .filter((p) => p.product.length > 0);\n\nscored.sort((a, b) => b.score - a.score);\n\nif (scored.length === 0) {\n  return emit({\n    emptyReason: 'nothing_extracted',\n    message: 'Scan complete. Nothing cleared the bar today.',\n    product: '(no products extracted)',\n    score: 0,\n    est_retail_usd: null,\n    est_landed_usd: null,\n    reason: 'Search results contained no shippable physical products',\n    risk: '',\n  });\n}\n\n// --- drop anything already reported on a previous run -----------------------\nconst store = $getWorkflowStaticData('global');\nif (!Array.isArray(store.seen)) store.seen = [];\n\nconst cutoff = new Date(Date.now() - RETENTION_DAYS * 86400000)\n  .toISOString()\n  .slice(0, 10);\nstore.seen = store.seen.filter((e) => e && e.p && String(e.d ?? '') >= cutoff);\n\nconst memory = store.seen.map((e) => ({ entry: e, tok: tokenize(e.p) }));\n\nconst fresh = [];\nfor (const p of scored) {\n  const tok = tokenize(p.product);\n  const hit = memory.find((m) => sameProduct(tok, m.tok));\n  if (hit) {\n    hit.entry.n = (hit.entry.n || 1) + 1;\n    hit.entry.last = date;\n    continue;\n  }\n  fresh.push(p);\n  const entry = { p: p.product, s: p.score, d: date, n: 1, last: date };\n  store.seen.push(entry);\n  memory.push({ entry, tok });\n}\n\nif (store.seen.length > MAX_MEMORY) {\n  store.seen = store.seen.slice(store.seen.length - MAX_MEMORY);\n}\n\nif (fresh.length === 0) {\n  return emit({\n    emptyReason: 'all_repeats',\n    message:\n      `Scan complete. ${scored.length} product` +\n      (scored.length === 1 ? '' : 's') +\n      ' scored, all already reported. Nothing new today.',\n    product: '(no new products)',\n    score: 0,\n    est_retail_usd: null,\n    est_landed_usd: null,\n    reason: 'Every product scored this run had been seen before',\n    risk: '',\n  });\n}\n\n// --- build the message ------------------------------------------------------\nconst survivors = fresh.filter((p) => p.score >= SCORE_THRESHOLD);\n\nlet message;\nif (survivors.length === 0) {\n  message = 'Scan complete. Nothing cleared the bar today.';\n} else {\n  const top = survivors.slice(0, TOP_N);\n  message = `*Product scan — ${date}*\\n\\n`;\n  top.forEach((p, i) => {\n    message += `*${i + 1}. ${clean(p.product)} — ${p.score}/10*\\n`;\n    message += `${clean(p.reason)}\\n`;\n    message += `Retail ~$${money(p.est_retail_usd)} | Landed ~$${money(p.est_landed_usd)}\\n`;\n    message += `Risk: ${clean(p.risk)}\\n\\n`;\n  });\n  message += '_Prices are estimates. Verify on AliExpress before buying._';\n}\n\nreturn fresh.map((p) => ({\n  json: {\n    ...p,\n    error: false,\n    hasNew: true,\n    passed: p.score >= SCORE_THRESHOLD,\n    emptyReason: null,\n    message,\n  },\n}));\n"
       },
       "id": "a1000000-0000-4000-8000-000000000006",
       "name": "Parse and Filter",
@@ -145,7 +145,7 @@
           "conditions": [
             {
               "id": "c1000000-0000-4000-8000-000000000001",
-              "leftValue": "={{ $json.hasProducts }}",
+              "leftValue": "={{ $json.hasNew }}",
               "rightValue": "",
               "operator": {
                 "type": "boolean",
@@ -159,7 +159,7 @@
         "options": {}
       },
       "id": "a1000000-0000-4000-8000-000000000007",
-      "name": "Anything Survive?",
+      "name": "Anything New?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
@@ -195,7 +195,7 @@
     {
       "parameters": {
         "chatId": "REPLACE_WITH_YOUR_TELEGRAM_CHAT_ID",
-        "text": "={{ $json.error ? 'Scan complete. Claude response could not be parsed. Raw: ' + String($json.raw).replace(/[_*`\\[\\]]/g, ' ').slice(0, 400) : 'Scan complete. Nothing cleared the bar today.' }}",
+        "text": "={{ $json.message }}",
         "additionalFields": {
           "parse_mode": "Markdown",
           "appendAttribution": false
@@ -207,7 +207,7 @@
       "typeVersion": 1.2,
       "position": [
         1000,
-        300
+        460
       ],
       "executeOnce": true,
       "credentials": {
@@ -315,8 +315,8 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.5,
       "position": [
-        760,
-        460
+        1000,
+        280
       ],
       "retryOnFail": true,
       "maxTries": 3,
@@ -389,23 +389,23 @@
       "main": [
         [
           {
-            "node": "Anything Survive?",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Log All Scores",
+            "node": "Anything New?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Anything Survive?": {
+    "Anything New?": {
       "main": [
         [
           {
             "node": "Telegram: Shortlist",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log All Scores",
             "type": "main",
             "index": 0
           }

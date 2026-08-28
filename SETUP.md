@@ -193,6 +193,12 @@ the node.
 To test the other branch, pin `"text": "[]"` instead and re-run — you should get
 `Scan complete. Nothing cleared the bar today.` and no shortlist.
 
+**One thing you cannot test by hand:** the cross-run de-duplication in section
+12. n8n does not persist workflow static data for manual executions, only for
+scheduled ones. Run the pinned test twice by hand and you will get the same six
+products both times. That is expected. De-duplication starts working once the
+workflow is Active and running on its schedule.
+
 When you are ready to test for real, unpin and click **Test workflow** again.
 That run costs about one cent.
 
@@ -216,8 +222,8 @@ ships.
 ```
 Daily 06:00 UTC
       ↓
-Search Queries          4 items out — one per query, month/year from $now
-      ↓
+Search Queries          4 items out — one per query, rotated daily from a
+      ↓                 pool of 12, month/year from $now
 Serper Search           runs 4×, once per query. Retry 3× / 5s
       ↓
 Flatten Results         4 responses → 1 text blob, deduped, ≤12,000 chars
@@ -225,28 +231,36 @@ Flatten Results         4 responses → 1 text blob, deduped, ≤12,000 chars
 Claude Score Products   one call: extraction + scoring. Retry 2×
       ↓
 Parse and Filter        strip fences → JSON → drop score<6 → sort desc
-      ↓                        ↓
-Anything Survive?        Log All Scores   ← every product, filtered ones too
-   ↓ true    ↓ false
-Shortlist   Nothing Found
+      ↓                 → drop anything reported on a previous run
+Anything New?
+   ↓ true                      ↓ false
+   ├── Telegram: Shortlist     └── Telegram: Nothing Found
+   └── Log All Scores
 ```
 
-Three things worth knowing if you go editing:
+Four things worth knowing if you go editing:
 
 **`Search Queries` emits four separate items, not one array.** In n8n a node
 runs once per input item, so four items is what makes `Serper Search` fire four
 times. Had it emitted one item holding an array, you would need an extra Split
 Out node to fan it back out.
 
-**`Parse and Filter` emits one item per product, and copies the same
-`hasProducts` flag and prebuilt `message` onto every one.** That is what lets a
-single Code node feed both a per-row sheet append and a single summary message.
+**`Parse and Filter` emits one item per NEW product, and copies the same
+`hasNew` flag and the same finished `message` onto every one.** That is what lets
+a single Code node feed both a per-row sheet append and a single summary message.
 Both Telegram nodes have **Execute Once** enabled, so they send one message from
 the first item rather than one per product.
 
-**`Log All Scores` hangs off `Parse and Filter`, not off the IF.** That is
-deliberate — the sheet gets the 3/10 rejects too. Those rejects are the point:
-they are the negative examples that make section 7 of the spec worth filling in.
+**All message wording lives in `Parse and Filter`, not in the Telegram nodes.**
+Both Telegram nodes are just `{{ $json.message }}`. If you want to reword
+anything the bot says, edit the Code node — that is the only place to look.
+
+**`Log All Scores` hangs off the IF's true branch.** On a day with nothing new,
+the false branch fires and no rows are written, which is what keeps the sheet
+from filling with the same products every day. Low scorers still reach the sheet
+— a product scoring 3/10 is new, takes the true branch, gets logged, and is
+simply left out of the Telegram message. Those rejects are the point: they are
+the negative examples that make section 7 of the spec worth filling in.
 
 **The Anthropic body is plain JSON with one expression in it.** The system
 prompt sits in the node as a literal string, so you can read and edit it in the
@@ -256,7 +270,7 @@ and newlines in the search text so the body stays valid JSON.
 
 ---
 
-## 9. Two places the build departs from the spec
+## 9. Where the build departs from the spec
 
 Both are noted so you can revert either in under a minute.
 
@@ -267,14 +281,24 @@ cannot fill from title and snippet alone — every value would be `null`. So
 variable and the `lines.push` ternary in that node. The 12,000-char cap holds
 either way; you get roughly 15% fewer results with URLs included.
 
-**The "nothing found" message reports parse failures.** The spec fixes node 8b's
-text as `Scan complete. Nothing cleared the bar today.` A failed parse also lands
-on that branch, and sending "nothing cleared the bar" when Claude actually
-returned something unreadable would hide a real bug. So the text is an
-expression: the spec string on the normal path, and
-`Scan complete. Claude response could not be parsed. Raw: ...` when
-`Parse and Filter` sets `error: true`. To revert, replace the whole Text field
-with the plain sentence.
+**Node 8b does not always send the fixed string.** The spec fixes its text as
+`Scan complete. Nothing cleared the bar today.` Three different situations reach
+that branch and only one of them is actually "nothing cleared the bar":
+
+| Situation | What gets sent |
+|---|---|
+| Claude returned no products at all | `Scan complete. Nothing cleared the bar today.` (the spec string) |
+| Everything scored was already reported | `Scan complete. N products scored, all already reported. Nothing new today.` |
+| Claude's reply would not parse | `Scan complete. Claude response could not be parsed. Raw: ...` |
+
+Sending "nothing cleared the bar" when Claude actually returned unreadable
+output, or when six good products were found and merely suppressed as repeats,
+would hide the thing you need to know. To revert, set the `message` variable in
+`Parse and Filter` to the fixed sentence on all three paths.
+
+Note the fixed string is still what you get when nothing scores 6 or above —
+that case takes the *true* branch now (the products are new, they just did not
+make the shortlist), so it is `Telegram: Shortlist` that sends it.
 
 One further judgement call, not a deviation: **product names are stripped of
 `_ * ` [ ]` rather than backslash-escaped** before going into Telegram. Telegram's
@@ -297,7 +321,10 @@ only the Telegram copy is sanitised.
 | `401` from Serper or Anthropic | Credential not attached to the node, or the header **name** is wrong — `X-API-KEY` for Serper, `x-api-key` for Anthropic. They are different. |
 | Sheet rows land in the wrong columns | Header row text does not match the seven column names exactly. |
 | A row with `(parse error)` | Claude returned non-JSON. The `raw` field in that execution holds the first 500 characters. |
-| A row with `(no products extracted)` | Claude returned a valid but empty array — usually a bad search day, occasionally a blob of only listicles. |
+| `Nothing new today` every day | De-duplication is working and the searches genuinely are returning the same products. See section 12 if you want to reset. |
+| Products you have never seen are being suppressed | Two different products matched as one. Section 12 explains the matcher and how to clear memory. |
+| De-duplication seems not to work | You are testing manually. n8n only persists static data on scheduled runs. Section 6. |
+| No sheet rows on some days | Expected: nothing new was found, so the false branch ran and wrote nothing. |
 | Every score is 7+ | The prompt anticipates this and tells Claude to re-score harder. If it persists, section 7 real data is what actually fixes it. |
 | Workflow runs but nothing arrives on Telegram | Check the workflow is **Active**, not just saved. |
 
@@ -331,3 +358,98 @@ The loop that fixes it:
 Ten real outcomes will move the scoring more than any amount of prompt
 rewriting. The flops matter more than the wins — they are the ones the generic
 prior gets wrong.
+
+---
+
+## 12. De-duplication and query rotation
+
+Two problems the original design had, and what was done about them.
+
+### The problem
+
+Three of the four spec queries interpolate the month, so for a whole calendar
+month they were the same four strings, and the fourth never changed at all.
+Google's top ten for those barely moves within a month. The result: day 1 was
+useful, days 2–30 returned the same products, and the sheet filled with the same
+rows over and over. The old within-run de-duplication in `Flatten Results` only
+looked at one execution, so it could not catch any of that.
+
+### Query rotation
+
+`Search Queries` now holds a pool of **12** queries and picks 4 per day. The pool
+size and the daily step (5) are coprime, so the starting offset visits every
+position in the pool before repeating — you see all 12 across 12 days, and no two
+consecutive days run the same four.
+
+The pool keeps all four original spec queries and adds eight more: different
+sources (`tiktok made me buy it`, `amazon movers and shakers`, `viral gadgets
+reddit`, `winning products to sell online`) and four category sweeps (kitchen,
+car, home organization, beauty tools). The category sweeps are the ones that
+surface products the general dropshipping listicles never mention.
+
+To add or remove queries, edit the `pool` array in the node. Nothing else needs
+changing — the rotation adapts to whatever length the pool is. Keep it coprime
+with 5 (avoid multiples of 5) or the rotation will visit only some positions.
+
+### Cross-run de-duplication
+
+`Parse and Filter` keeps a memory of every product it has already reported, in
+`$getWorkflowStaticData('global')` — a small JSON blob n8n stores on the workflow
+record itself. That is why this needed no extra node and no read from the sheet.
+
+A product already in memory is dropped before the Telegram message and before
+the sheet append. What reaches you is only what is genuinely new.
+
+**How two names are judged to be the same product.** Comparing strings directly
+would treat `LED Strip Lights`, `led strip lights` and `Strip Lights LED` as
+three different products. Instead each name is lowercased, stripped of
+punctuation, and reduced to a **set of words**. Two products match if:
+
+- the word sets are identical (handles case, punctuation, word order), or
+- one set contains the other **and both have at least two words** — so
+  `Portable cooling neck fan` matches a previously seen `Neck fan`. The two-word
+  floor stops a one-word name like `Fan` from swallowing every fan-adjacent
+  product.
+
+It is deliberately a blunt instrument. `Pimple patches` and `Acne patches` are
+the same product to a human and different products to this matcher. Erring
+toward showing you a near-duplicate is better than silently hiding something
+real.
+
+**Retention.** Entries expire after **90 days** and memory is capped at **500
+products**. A genuinely seasonal product can therefore resurface next quarter,
+which is usually what you want.
+
+**When memory is saved.** n8n writes static data only after an execution
+*succeeds*. If the Telegram send fails, the products are not marked as seen and
+you get them again next run. That is the safe direction to fail in — you may see
+a repeat, but you never lose a product to a failed send.
+
+**To reset the memory** (start reporting everything again): open the workflow,
+add a temporary Code node with
+
+```js
+$getWorkflowStaticData('global').seen = [];
+return $input.all();
+```
+
+run it once from the schedule, then delete the node. There is no UI for editing
+static data.
+
+### What this changes about the sheet
+
+The sheet no longer gets a row per product per day. It gets a row the **first**
+time each product is seen. Repeat sightings increment a counter in memory rather
+than adding rows.
+
+That makes the sheet a clean list of distinct products, which is what section 7
+of the spec actually needs. What it costs you is recurrence data — you can no
+longer see from the sheet that a product kept reappearing for three weeks, which
+is itself a weak signal of a sustained trend.
+
+The counter for that does exist, in memory: every repeat sighting bumps `n` on
+the stored entry. But repeats never reach the sheet, so mapping an eighth column
+to it would only ever write `1`. To actually recover recurrence you would have to
+emit repeats as well and switch the sheet node from **Append** to **Append or
+Update**, matching on `product` — a real change, not a one-line one. Worth doing
+only if you find yourself wanting that signal.
